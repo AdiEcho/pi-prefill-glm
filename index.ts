@@ -157,30 +157,58 @@ function isGLMModel(payload: any): boolean {
   return /glm/i.test(model);
 }
 
+/** 所有可能的 prefill 模板（用于清理历史消息中的残留） */
+function getAllPrefillTemplates(): string[] {
+  const templates = [PREFILL_THINKING_ZH.trim(), PREFILL_THINKING_EN.trim()];
+  if (state.customPrompt !== null) {
+    templates.push(state.customPrompt.trim());
+  }
+  return templates;
+}
+
 /**
  * 判断一条 assistant 消息是否是之前注入的 prefill（需要清理）。
- * 检查 content 是否完全匹配当前或任何预设模板。
+ * 使用前缀匹配：因为模型会在 prefill 后面续写内容，
+ * 保存到历史后 content = prefill + 模型回复，精确匹配会失败。
  */
 function isPrefillMessage(msg: any): boolean {
   if (msg?.role !== "assistant") return false;
   const ct = typeof msg.content === "string" ? msg.content.trim() : "";
   if (!ct) return false;
-  return (
-    ct === PREFILL_THINKING_ZH.trim() ||
-    ct === PREFILL_THINKING_EN.trim() ||
-    (state.customPrompt !== null && ct === state.customPrompt.trim())
-  );
+  return getAllPrefillTemplates().some(tpl => ct.startsWith(tpl));
+}
+
+/**
+ * 从 assistant 消息的 content 中移除 prefill 前缀。
+ * 如果移除后还剩有模型的实际回复内容，则保留该消息（只去掉 prefill 部分）；
+ * 如果移除后为空，则返回 null 表示整条消息应被丢弃。
+ */
+function stripPrefillFromMessage(msg: any): any | null {
+  if (msg?.role !== "assistant") return msg;
+  const ct = typeof msg.content === "string" ? msg.content.trim() : "";
+  if (!ct) return msg;
+
+  for (const tpl of getAllPrefillTemplates()) {
+    if (ct.startsWith(tpl)) {
+      const remaining = ct.slice(tpl.length).trim();
+      if (!remaining) return null; // 整条消息都是 prefill，丢弃
+      return { ...msg, content: remaining }; // 保留模型实际回复
+    }
+  }
+  return msg; // 不含 prefill，原样保留
 }
 
 function injectPrefillThinking(payload: any): any {
   if (!payload || !Array.isArray(payload.messages)) return payload;
 
-  // 1. 先清理历史中残留的旧 prefill 消息
-  //    上一轮注入的 assistant prefill 会被 pi 保存到对话历史，
-  //    若不清理则每轮都会多一条，导致模板原文反复出现。
-  const messages = payload.messages.filter(
-    (msg: any) => !isPrefillMessage(msg)
-  );
+  // 1. 清理历史中残留的旧 prefill 内容
+  //    上一轮注入的 assistant prefill 会被 pi 与模型回复合并后保存到对话历史。
+  //    这里需要：
+  //    - 对于纯 prefill 消息（未被续写）：整条丢弃
+  //    - 对于 prefill + 模型回复的合并消息：只移除 prefill 前缀，保留实际回复
+  const messages = payload.messages
+    .map((msg: any) => stripPrefillFromMessage(msg))
+    .filter((msg: any) => msg !== null);
 
   // 2. 在末尾追加新的 prefill assistant 消息
   const thinkingContent = getThinkingContent();
