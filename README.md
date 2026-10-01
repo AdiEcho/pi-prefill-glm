@@ -28,6 +28,34 @@ messages: [
 
 Anthropic 的 API 也支持在 `messages` 数组的最后一条设置 `role: "assistant"` 作为模型回复的前缀（assistant prefilling）。对于支持 extended thinking 的模型，攻击者可以构造 thinking tokens 来绕过安全检查。
 
+## 安装
+
+### 方式一：通过 pi 包安装（推荐）
+
+```bash
+pi install https://github.com/AdiEcho/pi-prefill-glm
+```
+
+安装后扩展将自动加载，无需额外配置。
+
+### 方式二：克隆仓库手动加载
+
+```bash
+git clone https://github.com/AdiEcho/pi-prefill-glm.git
+cd pi-prefill-glm
+pi --extension ./index.ts
+```
+
+### 方式三：放入扩展目录自动加载
+
+将仓库克隆到 pi 的用户扩展目录下：
+
+```bash
+git clone https://github.com/AdiEcho/pi-prefill-glm.git ~/.pi/agent/extensions/pi-prefill-glm
+```
+
+Pi 启动时会自动加载该目录下的扩展（通过 `index.ts` 入口）。
+
 ## 使用方法
 
 ### 1. 前置条件
@@ -42,14 +70,14 @@ Anthropic 的 API 也支持在 `messages` 数组的最后一条设置 `role: "as
       "apiKey": "$GLM_API_KEY",
       "models": [
         {
-          "id": "glm-4-plus",
-          "name": "GLM-4 Plus",
+          "id": "glm-5.3",
+          "name": "GLM-5.3",
           "api": "openai",
           "reasoning": false,
           "input": ["text"],
-          "cost": { "input": 0.5, "output": 0.5, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 128000,
-          "maxTokens": 4096
+          "cost": { "input": 8, "output": 28, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 1000000,
+          "maxTokens": 131072
         }
       ]
     }
@@ -57,17 +85,11 @@ Anthropic 的 API 也支持在 `messages` 数组的最后一条设置 `role: "as
 }
 ```
 
-### 2. 启动 Pi 并加载扩展
-
-```bash
-pi --extension ./index.ts
-```
-
-### 3. 切换到 GLM 模型
+### 2. 切换到 GLM 模型
 
 使用 `/model` 命令选择 GLM 模型。
 
-### 4. 控制注入
+### 3. 控制注入
 
 | 命令 | 说明 |
 |---|---|
@@ -78,7 +100,7 @@ pi --extension ./index.ts
 | `/prefill prompt` | 重置为默认模板 |
 | `/prefill lang <zh\|en>` | 切换中文/英文模板 |
 
-### 5. 验证流程
+### 4. 验证流程
 
 1. 先 **不启用** prefill，向 GLM 发送一个（安全的）测试问题，观察正常回复
 2. 执行 `/prefill on` 启用注入
