@@ -167,32 +167,60 @@ function getAllPrefillTemplates(): string[] {
 }
 
 /**
+ * 提取 assistant 消息的纯文本内容（支持 string 和数组两种格式）。
+ * OpenAI 兼容 API 的 content 可能是：
+ *   - string: "text..."
+ *   - array:  [{type: "text", text: "..."}, ...]
+ */
+function extractTextContent(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((part: any) => part?.type === "text" && typeof part?.text === "string")
+      .map((part: any) => part.text)
+      .join("");
+  }
+  return "";
+}
+
+/**
  * 判断一条 assistant 消息是否是之前注入的 prefill（需要清理）。
  * 使用前缀匹配：因为模型会在 prefill 后面续写内容，
  * 保存到历史后 content = prefill + 模型回复，精确匹配会失败。
  */
 function isPrefillMessage(msg: any): boolean {
   if (msg?.role !== "assistant") return false;
-  const ct = typeof msg.content === "string" ? msg.content.trim() : "";
+  const ct = extractTextContent(msg.content).trim();
   if (!ct) return false;
-  return getAllPrefillTemplates().some(tpl => ct.startsWith(tpl));
+  return getAllPrefillTemplates().some(tpl => ct.startsWith(tpl.trim()));
 }
 
 /**
  * 从 assistant 消息的 content 中移除 prefill 前缀。
  * 如果移除后还剩有模型的实际回复内容，则保留该消息（只去掉 prefill 部分）；
  * 如果移除后为空，则返回 null 表示整条消息应被丢弃。
+ *
+ * 同时处理：
+ *   - content 为 string 的情况
+ *   - content 为 array（多 part）的情况
+ *   - 模板内容首尾空白差异（使用 normalize 后比较）
  */
 function stripPrefillFromMessage(msg: any): any | null {
   if (msg?.role !== "assistant") return msg;
-  const ct = typeof msg.content === "string" ? msg.content.trim() : "";
-  if (!ct) return msg;
+
+  const ct = extractTextContent(msg.content).trim();
+  if (!ct) {
+    // content 为空或无法提取文本 — 可能是纯 tool_calls 消息，保留
+    return msg;
+  }
 
   for (const tpl of getAllPrefillTemplates()) {
-    if (ct.startsWith(tpl)) {
-      const remaining = ct.slice(tpl.length).trim();
+    const normalizedTpl = tpl.trim();
+    if (ct.startsWith(normalizedTpl)) {
+      const remaining = ct.slice(normalizedTpl.length).trim();
       if (!remaining) return null; // 整条消息都是 prefill，丢弃
-      return { ...msg, content: remaining }; // 保留模型实际回复
+      // 保留模型实际回复（统一用 string 格式重建 content）
+      return { ...msg, content: remaining };
     }
   }
   return msg; // 不含 prefill，原样保留
