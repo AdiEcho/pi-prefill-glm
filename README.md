@@ -83,14 +83,23 @@ pi --extension ./index.ts
 1. 先 **不启用** prefill，向 GLM 发送一个（安全的）测试问题，观察正常回复
 2. 执行 `/prefill on` 启用注入
 3. 发送相同的测试问题，对比模型回复的差异
-4. 查看日志文件 `.pi/prefill-glm.log` 和 `.pi/prefill-glm-payload.log`
+4. 退出并重启 pi，执行 `/prefill status` — 状态应保持为启用（见下文「状态持久化」）
 
-## 日志
+> 本扩展不写入任何日志文件。如需查看实际发送的请求 payload，可使用 pi 内置的 `/debug-provider` 命令。
 
-| 文件 | 内容 |
-|---|---|
-| `.pi/prefill-glm.log` | 每次注入的元信息（时间戳、模型、注入内容摘要） |
-| `.pi/prefill-glm-payload.log` | 注入后发送给 API 的完整 payload |
+## 状态持久化
+
+状态（`enabled` / `lang` / `customPrompt` / `injectionCount`）会自动持久化，**重启 pi 后依然保持**：
+
+- **磁盘状态文件** `.pi/prefill-glm-state.json`：每次状态变更（命令或注入）时写入；pi 重启后开启全新会话时自动读取恢复，状态栏的 ⚠️ 提醒也一并还原。
+- **Session entry**：状态快照同时追加到会话记录；恢复旧会话或切换分支时，还原该分支当时的状态（保证实验可复现）。
+
+`.pi/prefill-glm-state.json` 是本扩展写入磁盘的**唯一**文件 — 不产生任何日志。
+
+恢复优先级：**当前分支的 session entry > 磁盘状态文件 > 默认值（禁用）**。
+磁盘文件始终镜像“当前生效”的状态，因此重启后恢复的正是退出前最后生效的状态。
+
+重置方法：`/prefill off`，或直接删除 `.pi/prefill-glm-state.json`。
 
 ## 默认 Thinking 模板
 
@@ -142,5 +151,5 @@ before_provider_request 事件
    prefilled assistant 消息
          │
          ▼
-   记录日志 → 返回修改后的 payload
+   返回修改后的 payload
 ```

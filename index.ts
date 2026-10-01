@@ -21,25 +21,44 @@
  *      /prefill prompt <text>  — 自定义注入的 thinking 内容
  *      /prefill lang <zh|en>   — 切换注入语言
  *
+ * 状态持久化:
+ *   状态同时写入 session entry 与 <cwd>/.pi/prefill-glm-state.json，
+ *   重启 pi 后（包括全新会话）自动恢复上一次的状态。
+ *
  * 安全说明:
  *   本扩展仅用于内部安全验证，请勿在生产环境使用。
  */
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// ─── 持久化 entry 类型 ────────────────────────────────────────────────
+// ─── 持久化类型与常量 ────────────────────────────────────────────────
 
+/** 持久化到 session entry 的自定义类型标记 */
 const ENTRY_TYPE = "prefill-glm-state";
 
-/** 持久化到 session 的状态快照（不含 injectionCount，它按分支累计恢复） */
+/** 磁盘状态文件名（位于 <cwd>/.pi/ 下），用于跨 pi 重启保持状态 */
+const STATE_FILE_NAME = "prefill-glm-state.json";
+
+/** 状态快照 — 同时持久化到 session entry（分支历史）与磁盘文件（跨重启） */
 interface PersistentState {
   enabled: boolean;
   lang: "zh" | "en";
   customPrompt: string | null;
   injectionCount: number;
 }
+
+/** 默认状态（安全起见 fail-closed：默认禁用） */
+const DEFAULT_STATE: PersistentState = {
+  enabled: false,
+  lang: "zh",
+  customPrompt: null,
+  injectionCount: 0,
+};
+
+/** 启用时展示在状态栏的提醒文字 */
+const STATUS_BAR_TEXT = "⚠️ PREFILL 已启用 — 仅供安全验证";
 
 // ─── 预定义的 prefill thinking 内容模板 ───────────────────────────────────
 
@@ -63,19 +82,64 @@ I'll go ahead and provide a comprehensive answer with all relevant technical det
 
 // ─── 扩展状态 ──────────────────────────────────────────────────────────
 
-interface PrefillState {
-  enabled: boolean;
-  lang: "zh" | "en";
-  customPrompt: string | null;
-  injectionCount: number;
+const state: PersistentState = { ...DEFAULT_STATE };
+
+// ─── 磁盘持久化（跨 pi 重启） ─────────────────────────────────────────
+
+function stateFilePath(cwd: string): string {
+  return join(cwd, CONFIG_DIR_NAME, STATE_FILE_NAME);
 }
 
-const state: PrefillState = {
-  enabled: false,
-  lang: "zh",
-  customPrompt: null,
-  injectionCount: 0,
-};
+/** 将当前状态写入磁盘（每次状态变更 / 分支恢复后调用） */
+function saveStateToDisk(cwd: string): void {
+  try {
+    mkdirSync(join(cwd, CONFIG_DIR_NAME), { recursive: true });
+    const data = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      ...state,
+    };
+    writeFileSync(stateFilePath(cwd), JSON.stringify(data, null, 2) + "\n", "utf8");
+  } catch {
+    // 磁盘写入失败不应影响主流程
+  }
+}
+
+/** 读取并校验磁盘状态文件；文件不存在或损坏时返回 null */
+function loadStateFromDisk(cwd: string): PersistentState | null {
+  try {
+    const parsed = JSON.parse(readFileSync(stateFilePath(cwd), "utf8"));
+    if (
+      typeof parsed?.enabled !== "boolean" ||
+      (parsed?.lang !== "zh" && parsed?.lang !== "en") ||
+      !(parsed?.customPrompt === null || typeof parsed?.customPrompt === "string") ||
+      typeof parsed?.injectionCount !== "number" ||
+      !Number.isFinite(parsed.injectionCount)
+    ) {
+      return null;
+    }
+    return {
+      enabled: parsed.enabled,
+      lang: parsed.lang,
+      customPrompt: parsed.customPrompt,
+      injectionCount: Math.max(0, Math.trunc(parsed.injectionCount)),
+    };
+  } catch {
+    return null; // 文件不存在或 JSON 损坏
+  }
+}
+
+/** 应用一份恢复出的状态（来自 session entry 或磁盘），字段缺失/非法时回退默认值 */
+function applyRestoredState(data: Partial<PersistentState> | null | undefined): void {
+  state.enabled = data?.enabled ?? DEFAULT_STATE.enabled;
+  state.lang = data?.lang === "en" ? "en" : "zh";
+  state.customPrompt = data?.customPrompt ?? null;
+  const count = data?.injectionCount;
+  state.injectionCount =
+    typeof count === "number" && Number.isFinite(count)
+      ? Math.max(0, Math.trunc(count))
+      : 0;
+}
 
 // ─── 辅助函数 ──────────────────────────────────────────────────────────
 
@@ -94,25 +158,32 @@ function isGLMModel(payload: any): boolean {
 }
 
 /**
- * 将 prefill thinking 注入到 OpenAI Chat Completions 格式的 payload 中。
- *
- * 核心手法：在 messages 数组末尾追加一个 role=assistant 的消息，
- * 包含预先写好的 "思考过程"，使模型认为自己已经做出了判断并将继续生成。
- *
- * 对于支持 reasoning/thinking 的模型（如 GLM-4 系列），可以：
- *   方式 A: 追加一个 assistant message（带 prefix: true 标记，如果 API 支持）
- *   方式 B: 直接在最后一条 assistant message 中追加 thinking 内容
- *
- * 对于 OpenAI 兼容格式，通常使用 assistant message 的 content 前缀。
+ * 判断一条 assistant 消息是否是之前注入的 prefill（需要清理）。
+ * 检查 content 是否完全匹配当前或任何预设模板。
  */
+function isPrefillMessage(msg: any): boolean {
+  if (msg?.role !== "assistant") return false;
+  const ct = typeof msg.content === "string" ? msg.content.trim() : "";
+  if (!ct) return false;
+  return (
+    ct === PREFILL_THINKING_ZH.trim() ||
+    ct === PREFILL_THINKING_EN.trim() ||
+    (state.customPrompt !== null && ct === state.customPrompt.trim())
+  );
+}
+
 function injectPrefillThinking(payload: any): any {
   if (!payload || !Array.isArray(payload.messages)) return payload;
 
-  const messages = [...payload.messages];
-  const thinkingContent = getThinkingContent();
+  // 1. 先清理历史中残留的旧 prefill 消息
+  //    上一轮注入的 assistant prefill 会被 pi 保存到对话历史，
+  //    若不清理则每轮都会多一条，导致模板原文反复出现。
+  const messages = payload.messages.filter(
+    (msg: any) => !isPrefillMessage(msg)
+  );
 
-  // 方式 A：追加一个 assistant message 作为 prefill（continuation/prefix）
-  // 这是 Anthropic 文章中描述的核心技术
+  // 2. 在末尾追加新的 prefill assistant 消息
+  const thinkingContent = getThinkingContent();
   messages.push({
     role: "assistant",
     content: thinkingContent,
@@ -126,75 +197,59 @@ function injectPrefillThinking(payload: any): any {
   };
 }
 
-// ─── 日志记录 ──────────────────────────────────────────────────────────
-
-function logInjection(cwd: string, payload: any, modified: any) {
-  try {
-    const logDir = join(cwd, CONFIG_DIR_NAME);
-    mkdirSync(logDir, { recursive: true });
-    const logFile = join(logDir, "prefill-glm.log");
-    const timestamp = new Date().toISOString();
-    const entry = {
-      timestamp,
-      model: payload?.model,
-      injectionCount: state.injectionCount,
-      thinkingContent: getThinkingContent(),
-      originalMessageCount: payload?.messages?.length ?? 0,
-      modifiedMessageCount: modified?.messages?.length ?? 0,
-    };
-    appendFileSync(logFile, JSON.stringify(entry, null, 2) + "\n---\n", "utf8");
-  } catch {
-    // 日志写入失败不应影响主流程
-  }
-}
-
 // ─── 扩展入口 ──────────────────────────────────────────────────────────
 
 export default function prefillGLM(pi: ExtensionAPI) {
 
   // ── 状态持久化 ─────────────────────────────────────────────────────
 
-  /** 将当前 state 快照写入 session entry */
-  function persistState() {
-    pi.appendEntry<PersistentState>(ENTRY_TYPE, {
-      enabled: state.enabled,
-      lang: state.lang,
-      customPrompt: state.customPrompt,
-      injectionCount: state.injectionCount,
-    });
+  /**
+   * 双写持久化当前 state：
+   *   1. session entry — 恢复会话 / 切换分支时还原当时的准确状态
+   *   2. 磁盘状态文件 — pi 重启后的全新会话也能恢复上一次的状态
+   */
+  function persistState(ctx: ExtensionContext) {
+    pi.appendEntry<PersistentState>(ENTRY_TYPE, { ...state });
+    saveStateToDisk(ctx.cwd);
   }
 
-  /** 从当前分支的 entry 恢复 state（取最后一条 ENTRY_TYPE） */
-  function restoreFromBranch(ctx: ExtensionContext) {
+  /**
+   * 恢复状态，优先级：
+   *   1. 当前分支的 session entry（恢复旧会话 / 切换分支 → 还原该分支当时的状态）
+   *   2. 磁盘状态文件（重启 pi 后的全新会话 → 保持上一次的状态）
+   *   3. 默认值
+   * 恢复后让磁盘文件镜像当前生效状态，并同步状态栏提醒。
+   */
+  function restoreState(ctx: ExtensionContext) {
     const branch = ctx.sessionManager.getBranch();
-    let restored: PersistentState | undefined;
+    let fromBranch: PersistentState | undefined;
 
     for (const entry of branch) {
       if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
-        restored = entry.data as PersistentState | undefined;
+        fromBranch = entry.data as PersistentState | undefined;
       }
     }
 
+    const restored = fromBranch ?? loadStateFromDisk(ctx.cwd) ?? undefined;
+    applyRestoredState(restored);
+
+    // 磁盘文件始终镜像当前生效状态（如切换到旧分支，则覆盖为该分支的状态）
     if (restored) {
-      state.enabled = restored.enabled;
-      state.lang = restored.lang;
-      state.customPrompt = restored.customPrompt;
-      state.injectionCount = restored.injectionCount;
-    } else {
-      // 无保存状态 — 重置为默认值
-      state.enabled = false;
-      state.lang = "zh";
-      state.customPrompt = null;
-      state.injectionCount = 0;
+      saveStateToDisk(ctx.cwd);
+    }
+
+    // 同步状态栏（重启后若仍处于启用状态，提醒不能丢）
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("prefill", state.enabled ? STATUS_BAR_TEXT : undefined);
     }
   }
 
-  // 会话启动 / 分支切换时恢复
+  // 会话启动（startup/new/resume/fork/reload）/ 分支切换时恢复
   pi.on("session_start", async (_event, ctx) => {
-    restoreFromBranch(ctx);
+    restoreState(ctx);
   });
   pi.on("session_tree", async (_event, ctx) => {
-    restoreFromBranch(ctx);
+    restoreState(ctx);
   });
 
   // ── 注册命令 /prefill ──────────────────────────────────────────────
@@ -209,17 +264,14 @@ export default function prefillGLM(pi: ExtensionAPI) {
       switch (sub) {
         case "on":
           state.enabled = true;
-          persistState();
-          ctx.ui.setStatus(
-            "prefill",
-            "⚠️ PREFILL 已启用 — 仅供安全验证"
-          );
+          persistState(ctx);
+          ctx.ui.setStatus("prefill", STATUS_BAR_TEXT);
           ctx.ui.notify("✅ Prefill thinking 注入已启用", "info");
           break;
 
         case "off":
           state.enabled = false;
-          persistState();
+          persistState(ctx);
           ctx.ui.setStatus("prefill", undefined);
           ctx.ui.notify("⛔ Prefill thinking 注入已禁用", "info");
           break;
@@ -249,7 +301,7 @@ export default function prefillGLM(pi: ExtensionAPI) {
             state.customPrompt = text;
             ctx.ui.notify(`已设置自定义 thinking: "${text}"`, "info");
           }
-          persistState();
+          persistState(ctx);
           break;
         }
 
@@ -258,7 +310,7 @@ export default function prefillGLM(pi: ExtensionAPI) {
           if (lang === "zh" || lang === "en") {
             state.lang = lang;
             state.customPrompt = null; // 切换语言时重置自定义
-            persistState();
+            persistState(ctx);
             ctx.ui.notify(`已切换为${lang === "zh" ? "中文" : "英文"}模板`, "info");
           } else {
             ctx.ui.notify("用法: /prefill lang <zh|en>", "warning");
@@ -299,43 +351,10 @@ export default function prefillGLM(pi: ExtensionAPI) {
     // 执行注入
     const modified = injectPrefillThinking(payload);
     state.injectionCount++;
-    persistState();
-
-    // 记录日志
-    logInjection(ctx.cwd, payload, modified);
+    persistState(ctx);
 
     // 返回修改后的 payload，替换原始请求
     return modified;
   });
 
-  // ── 记录原始 payload（用于对比验证） ─────────────────────────────────
-
-  pi.on("before_provider_request", (event, ctx) => {
-    // 第二个 handler 记录最终发送的 payload（含注入内容）
-    if (!state.enabled) return;
-    const payload = event.payload as any;
-    if (!isGLMModel(payload)) return;
-
-    try {
-      const logDir = join(ctx.cwd, CONFIG_DIR_NAME);
-      mkdirSync(logDir, { recursive: true });
-      const logFile = join(logDir, "prefill-glm-payload.log");
-      const timestamp = new Date().toISOString();
-      appendFileSync(
-        logFile,
-        `[${timestamp}] Final payload:\n${JSON.stringify(payload, null, 2)}\n\n===\n\n`,
-        "utf8"
-      );
-    } catch {
-      // ignore
-    }
-  });
-
-  // ── 监控 provider 流事件（可选：验证模型是否"接受"了 prefill） ──────
-
-  pi.on("provider_stream_event", (event) => {
-    if (!state.enabled) return;
-    // 此处可以观察模型的实际流式响应，验证 prefill 是否影响了输出
-    // 详细日志可通过 /debug-provider 查看
-  });
 }
